@@ -1,0 +1,38 @@
+# /etc/network/interfaces - MWAN01
+# Las WAN no llevan gateway: las rutas por defecto las gestiona mwan-apply (tablas isp1/isp2).
+# ifupdown no admite comentarios al final de linea.
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+# Lado interno: cable T3 hacia FW01
+auto t3
+iface t3 inet static
+    address 10.10.3.1/30
+    up ip route replace 192.168.10.0/24 via 10.10.3.2 dev t3
+    up ip route replace 192.168.20.0/24 via 10.10.3.2 dev t3
+    up ip route replace 192.168.30.0/24 via 10.10.3.2 dev t3
+    up ip route replace 192.168.40.0/24 via 10.10.3.2 dev t3
+    up ip route replace 10.10.1.0/30    via 10.10.3.2 dev t3
+    up ip route replace 10.10.2.0/30    via 10.10.3.2 dev t3
+    up ip route replace 172.16.50.0/27  via 10.10.3.2 dev t3
+    up ip route replace 172.16.60.0/29  via 10.10.3.2 dev t3
+    up ip route replace 10.200.10.0/24  via 10.10.3.2 dev t3
+    up ip route replace 10.200.20.0/24  via 10.10.3.2 dev t3
+
+# ISP1: Wi-Fi
+allow-hotplug wan1
+iface wan1 inet static
+    address 10.249.196.234/24
+    wpa-ssid "POCO_F6_PRO"
+    wpa-psk "hola123456"
+    up ip route replace default via 10.249.196.94 dev wan1 table isp1 || true
+    up /usr/local/sbin/mwan-apply --quiet || true
+
+# ISP2: celular por USB (anclaje)
+allow-hotplug wan2
+iface wan2 inet static
+    address 192.168.91.234/24
+    up ip route replace default via 192.168.91.116 dev wan2 table isp2 || true
+    up /usr/local/sbin/mwan-apply --quiet || true

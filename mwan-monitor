@@ -1,0 +1,92 @@
+#!/bin/bash
+# mwan-monitor - failover y recuperacion de MWAN01 (servicio mwan-monitor.service)
+# Cada INTERVALO segundos hace ping a OBJETIVOS por cada ISP (ping -I <IP de la WAN>).
+# FALLOS_PARA_CAIDA fallos seguidos marcan el ISP como DOWN; EXITOS_PARA_RECUPERAR exitos, UP.
+# En cada cambio: escribe /run/multiwan/estado, ejecuta mwan-apply y, si un ISP cayo,
+# borra del conntrack las conexiones marcadas con ese ISP. Latencias en /run/multiwan/latencia_ISPn.
+# Eventos por logger (eventos.log).
+set -u
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+CONF=/etc/multiwan/multiwan.conf
+EST=/run/multiwan
+mkdir -p "$EST"
+
+# shellcheck source=/dev/null
+source "$CONF"
+INTERVALO="${INTERVALO:-5}"
+FALLOS_PARA_CAIDA="${FALLOS_PARA_CAIDA:-3}"
+EXITOS_PARA_RECUPERAR="${EXITOS_PARA_RECUPERAR:-3}"
+OBJETIVOS="${OBJETIVOS:-8.8.8.8 1.1.1.1}"
+
+registrar() { logger -t mwan-monitor -- "$*"; echo "$(date '+%F %T') $*"; }
+
+declare -A ESTADO=( [ISP1]=UP [ISP2]=UP )
+declare -A FALLOS=( [ISP1]=0 [ISP2]=0 )
+declare -A EXITOS=( [ISP1]=0 [ISP2]=0 )
+declare -A MARCA=( [ISP1]=1 [ISP2]=2 )
+
+escribir_estado() {
+    printf 'ISP1=%s\nISP2=%s\nACTUALIZADO=%s\n' "${ESTADO[ISP1]}" "${ESTADO[ISP2]}" "$(date '+%F %T')" \
+        > "$EST/estado.tmp" && mv -f "$EST/estado.tmp" "$EST/estado"
+    chmod 644 "$EST/estado"
+}
+
+# 0 si algun objetivo responde por ese ISP
+probar() {
+    local isp="$1" v_if="${1}_IF" v_ip="${1}_IP" ifc dir salida lat t
+    ifc="${!v_if}"; dir="${!v_ip}"
+    # sin interfaz o sin su IP: falla directa
+    if ! ip -4 -o addr show dev "$ifc" 2>/dev/null | grep -qF " $dir/"; then
+        echo "-1" > "$EST/latencia_$isp"; return 1
+    fi
+    for t in $OBJETIVOS; do
+        if salida="$(ping -n -q -c 1 -W 1 -I "$dir" "$t" 2>/dev/null)"; then
+            lat="$(awk -F'/' '/^rtt/ {print $5}' <<< "$salida")"
+            echo "${lat:-0}" > "$EST/latencia_$isp"
+            return 0
+        fi
+    done
+    echo "-1" > "$EST/latencia_$isp"
+    return 1
+}
+
+escribir_estado
+mwan-apply --quiet || registrar "ADVERTENCIA: mwan-apply falló al iniciar"
+registrar "Monitor iniciado: objetivos [$OBJETIVOS] cada ${INTERVALO}s; caída tras $FALLOS_PARA_CAIDA fallos, recuperación tras $EXITOS_PARA_RECUPERAR éxitos"
+
+while true; do
+    cambio=0
+    caidos=()
+    for isp in ISP1 ISP2; do
+        if probar "$isp"; then
+            FALLOS[$isp]=0
+            EXITOS[$isp]=$(( ${EXITOS[$isp]} + 1 ))
+            if [ "${ESTADO[$isp]}" = DOWN ] && (( ${EXITOS[$isp]} >= EXITOS_PARA_RECUPERAR )); then
+                ESTADO[$isp]=UP; cambio=1
+                registrar "RECUPERACION: $isp vuelve a responder -> UP (se restablece la política normal)"
+            fi
+        else
+            EXITOS[$isp]=0
+            FALLOS[$isp]=$(( ${FALLOS[$isp]} + 1 ))
+            if [ "${ESTADO[$isp]}" = UP ] && (( ${FALLOS[$isp]} >= FALLOS_PARA_CAIDA )); then
+                ESTADO[$isp]=DOWN; cambio=1; caidos+=("$isp")
+                registrar "FAILOVER: $isp no responde ($FALLOS_PARA_CAIDA pruebas fallidas) -> DOWN; su tráfico pasa al otro ISP"
+            fi
+        fi
+    done
+
+    if (( cambio )); then
+        escribir_estado
+        if mwan-apply --quiet; then
+            registrar "Reglas regeneradas: ISP1=${ESTADO[ISP1]} ISP2=${ESTADO[ISP2]}"
+        else
+            registrar "ERROR: mwan-apply falló al regenerar las reglas"
+        fi
+        for isp in "${caidos[@]}"; do
+            resultado="$(conntrack -D --mark "${MARCA[$isp]}" 2>&1 | tail -1)"
+            registrar "conntrack: conexiones marcadas $isp borradas ($resultado)"
+        done
+    fi
+    sleep "$INTERVALO"
+done

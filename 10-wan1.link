@@ -1,0 +1,6 @@
+# /etc/systemd/network/10-wan1.link - MWAN01
+[Match]
+MACAddress=98:59:7a:a5:73:00
+
+[Link]
+Name=wan1

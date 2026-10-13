@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""mwan-apply: aplica la configuracion Multi-WAN de MWAN01.
+
+Lee multiwan.conf, politicas.conf y /run/multiwan/estado (escrito por mwan-monitor).
+Valida los archivos antes de cambiar nada; si una linea esta mal, aborta y deja las reglas actuales.
+Configura las tablas isp1/isp2, las ip rule (1000, 1100, 1101, 1200, 1201), la ruta por defecto
+del ISP activo y carga la tabla nft "inet mwan" (/var/lib/multiwan/mwan.nft) en una sola transaccion.
+
+Uso: mwan-apply [--check | --dry-run | --flush | --quiet]
+  --check    solo validar         --dry-run  mostrar comandos y ruleset sin aplicar
+  --flush    ademas borra las conexiones marcadas para que se reclasifiquen
+  --quiet    sin salida (lo usan mwan-monitor e ifupdown)
+"""
+import ipaddress
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+
+CONF = "/etc/multiwan/multiwan.conf"
+ESTADO = "/run/multiwan/estado"
+SALIDA_NFT = "/var/lib/multiwan/mwan.nft"
+RESUMEN = "/run/multiwan/aplicado"
+
+TABLA = {"ISP1": 100, "ISP2": 200}
+MARCA = {"ISP1": 0x1, "ISP2": 0x2}
+OTRO = {"ISP1": "ISP2", "ISP2": "ISP1"}
+PRIVADAS = "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
+
+ARGS = set(sys.argv[1:])
+DRY = "--dry-run" in ARGS
+QUIET = "--quiet" in ARGS
+
+os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def info(msg):
+    if not QUIET:
+        print(msg)
+
+
+def error(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def bitacora(msg):
+    """Registra en syslog (rsyslog lo guarda en /var/log/multiwan/eventos.log)."""
+    if not DRY:
+        subprocess.run(["logger", "-t", "mwan-apply", msg], check=False)
+
+
+# 1. Lectura y validación
+def leer_conf(ruta):
+    """Archivo estilo shell KEY=VALOR (lo comparten este script y mwan-monitor)."""
+    datos = {}
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            for n, linea in enumerate(f, 1):
+                linea = linea.split("#", 1)[0].strip()
+                if not linea:
+                    continue
+                if "=" not in linea:
+                    error(f"{ruta}:{n}: se esperaba CLAVE=VALOR")
+                k, v = linea.split("=", 1)
+                datos[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        error(f"no existe {ruta}")
+    for k in ("ISP1_IF", "ISP1_IP", "ISP1_GW", "ISP2_IF", "ISP2_IP", "ISP2_GW", "LAN_IF"):
+        if not datos.get(k):
+            error(f"falta {k} en {ruta}")
+    for k in ("ISP1_IP", "ISP1_GW", "ISP2_IP", "ISP2_GW"):
+        try:
+            ipaddress.IPv4Address(datos[k])
+        except ValueError:
+            error(f"{k}={datos[k]} no es una IPv4 válida")
+    datos.setdefault("POLITICAS", "/etc/multiwan/politicas.conf")
+    datos.setdefault("BALANCEO_MODO", "hash")
+    if datos["BALANCEO_MODO"] not in ("hash", "conexion", "rr"):
+        error("BALANCEO_MODO debe ser hash, conexion o rr")
+    try:
+        p1, p2 = int(datos.get("PESO_ISP1", 50)), int(datos.get("PESO_ISP2", 50))
+    except ValueError:
+        error("PESO_ISP1 y PESO_ISP2 deben ser números")
+    if p1 < 0 or p2 < 0 or p1 + p2 != 100:
+        error("PESO_ISP1 + PESO_ISP2 debe sumar 100")
+    datos["PESO_ISP1"], datos["PESO_ISP2"] = p1, p2
+    return datos
+
+
+# <ip_origen>, [<puertos>], <protocolo>, <ISP_salida>
+LINEA_POLITICA = re.compile(
+    r"^(?P<ip>[^,\s]+)\s*,\s*\[(?P<puertos>[^\]]*)\]\s*,\s*(?P<proto>[A-Za-z/]+)\s*,\s*(?P<isp>\S+)$")
+
+
+def leer_puertos(texto, n):
+    texto = texto.replace(" ", "")
+    if texto in ("", "*"):
+        return []                                  # cualquier puerto
+    puertos = []
+    for item in texto.split(","):
+        m = re.fullmatch(r"(\d{1,5})(?:-(\d{1,5}))?", item)
+        if not m:
+            error(f"politicas.conf línea {n}: puerto inválido '{item}'")
+        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+        if not (1 <= a <= b <= 65535):
+            error(f"politicas.conf línea {n}: puerto o rango inválido '{item}' (1-65535)")
+        puertos.append(str(a) if a == b else f"{a}-{b}")
+    return puertos
+
+
+def leer_politicas(ruta):
+    politicas = []
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            lineas = f.readlines()
+    except FileNotFoundError:
+        error(f"no existe {ruta}")
+    for n, linea in enumerate(lineas, 1):
+        texto = linea.split("#", 1)[0].strip()
+        if not texto:
+            continue
+        m = LINEA_POLITICA.match(texto)
+        if not m:
+            error(f"politicas.conf línea {n}: formato inválido -> {texto!r}\n"
+                  f"       formato: <ip_origen>, [<puertos>], <TCP|UDP|TCP/UDP|ICMP>, <ISP1|ISP2>")
+        try:
+            red = ipaddress.IPv4Network(m.group("ip"), strict=False)
+        except ValueError:
+            error(f"politicas.conf línea {n}: IP/red de origen inválida '{m.group('ip')}'")
+        proto = m.group("proto").upper()
+        if proto not in ("TCP", "UDP", "TCP/UDP", "ICMP"):
+            error(f"politicas.conf línea {n}: protocolo '{proto}' (use TCP, UDP, TCP/UDP o ICMP)")
+        isp = m.group("isp").upper()
+        if isp not in TABLA:
+            error(f"politicas.conf línea {n}: ISP '{isp}' (use ISP1 o ISP2)")
+        puertos = leer_puertos(m.group("puertos"), n)
+        if proto == "ICMP" and puertos:
+            error(f"politicas.conf línea {n}: ICMP no usa puertos (escriba [] o [*])")
+        politicas.append({"id": len(politicas) + 1, "linea": n, "red": red,
+                          "puertos": puertos, "proto": proto, "isp": isp, "texto": texto})
+    return politicas
+
+
+def leer_estado():
+    estado = {"ISP1": "UP", "ISP2": "UP"}
+    try:
+        with open(ESTADO, encoding="utf-8") as f:
+            for linea in f:
+                k, _, v = linea.strip().partition("=")
+                if k in estado and v in ("UP", "DOWN"):
+                    estado[k] = v
+    except FileNotFoundError:
+        pass                                      # al arrancar se asume que ambos están UP
+    return estado
+
+
+def isp_efectivo(isp, estado):
+    """Failover: si el ISP de la regla está caído y el otro no, se usa el otro."""
+    if estado[isp] == "DOWN" and estado[OTRO[isp]] == "UP":
+        return OTRO[isp]
+    return isp
+
+
+# 2. Generación del ruleset nftables
+def regla_politica(p, estado):
+    efectivo = isp_efectivo(p["isp"], estado)
+    etiqueta = p["isp"] if efectivo == p["isp"] else f"{p['isp']}>{efectivo}"
+    coincide = [f"ip saddr {p['red'].with_prefixlen}"]
+    lista = ", ".join(p["puertos"])
+    if p["proto"] == "ICMP":
+        coincide.append("meta l4proto icmp")
+    elif p["proto"] == "TCP/UDP":
+        coincide.append("meta l4proto { tcp, udp }")
+        if lista:
+            coincide.append(f"th dport {{ {lista} }}")
+    else:
+        proto = p["proto"].lower()
+        coincide.append(f"{proto} dport {{ {lista} }}" if lista else f"meta l4proto {proto}")
+    # la cadena solo ve el primer paquete: counter = conexiones por politica
+    accion = (f"counter meta mark set 0x{MARCA[efectivo]:x} ct mark set meta mark "
+              f'log prefix "MWAN-POL P{p["id"]:02d} {etiqueta} " level info return')
+    comentario = p["texto"].replace('"', "'")[:120]
+    return f'        {" ".join(coincide)} {accion} comment "{comentario}"'
+
+
+def reglas_balanceo(conf, estado):
+    p1, p2 = conf["PESO_ISP1"], conf["PESO_ISP2"]
+    vivos = [i for i in ("ISP1", "ISP2") if estado[i] == "UP"]
+    if len(vivos) == 1:                           # un ISP caído: todo al que queda
+        unico = vivos[0]
+        return [f'        counter meta mark set 0x{MARCA[unico]:x} ct mark set meta mark '
+                f'log prefix "MWAN-POL BAL {unico} (failover) " level info return']
+    if p2 == 0 or p1 == 0:                        # pesos 100/0
+        unico = "ISP1" if p2 == 0 else "ISP2"
+        return [f'        counter meta mark set 0x{MARCA[unico]:x} ct mark set meta mark '
+                f'log prefix "MWAN-POL BAL {unico} " level info return']
+    mapa = f"{{ 0-{p1 - 1} : 0x1, {p1}-99 : 0x2 }}"
+    if conf["BALANCEO_MODO"] == "hash":           # misma pareja origen/destino -> mismo ISP
+        expr = f"jhash ip saddr . ip daddr mod 100 seed 0x58454c41 map {mapa}"
+    elif conf["BALANCEO_MODO"] == "conexion":     # cada conexión nueva, al azar según pesos
+        expr = f"numgen random mod 100 map {mapa}"
+    else:                                         # rr: alterna ISP1, ISP2, ISP1... (ignora pesos)
+        expr = "numgen inc mod 2 map { 0 : 0x1, 1 : 0x2 }"
+    return [f"        meta mark set {expr} ct mark set meta mark",
+            '        meta mark 0x1 counter log prefix "MWAN-POL BAL ISP1 " level info return',
+            '        meta mark 0x2 counter log prefix "MWAN-POL BAL ISP2 " level info return']
+
+
+def generar_nft(conf, politicas, estado):
+    fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lan, w1, w2 = conf["LAN_IF"], conf["ISP1_IF"], conf["ISP2_IF"]
+    reglas = "\n".join(regla_politica(p, estado) for p in politicas) or "        # (sin políticas)"
+    balanceo = "\n".join(reglas_balanceo(conf, estado))
+    modo = conf["BALANCEO_MODO"]
+    return f"""# generado por mwan-apply el {fecha} desde {conf['POLITICAS']} ({len(politicas)} politicas)
+# estado: ISP1={estado['ISP1']} ISP2={estado['ISP2']}, balanceo={modo} {conf['PESO_ISP1']}/{conf['PESO_ISP2']}
+
+table inet mwan
+delete table inet mwan
+
+table inet mwan {{
+    chain prerouting {{
+        type filter hook prerouting priority mangle; policy accept;
+
+        # conexiones entrantes: la respuesta sale por el mismo ISP
+        iifname "{w1}" ct state new ct mark set 0x1
+        iifname "{w2}" ct state new ct mark set 0x2
+
+        # conexion ya clasificada
+        iifname "{lan}" ct mark != 0x0 meta mark set ct mark return
+
+        # conexion nueva
+        iifname "{lan}" jump clasificar
+    }}
+
+    chain clasificar {{
+        # solo se clasifica lo que va a Internet
+        fib daddr type local return
+        ip daddr {{ {PRIVADAS} }} return
+
+        # politicas
+{reglas}
+
+        # balanceo
+{balanceo}
+    }}
+}}
+"""
+
+
+# 3. Policy routing (ip rule / ip route)
+def ejecutar(cmd, obligatorio=False):
+    if DRY:
+        print("   + " + " ".join(cmd))
+        return True
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        msg = f"'{' '.join(cmd)}' -> {r.stderr.strip()}"
+        if obligatorio:
+            error(msg)
+        info(f"   aviso: {msg}")
+        return False
+    return True
+
+
+def configurar_ruteo(conf, estado):
+    for prio in (1000, 1100, 1101, 1200, 1201):
+        if not DRY:
+            while subprocess.run(["ip", "rule", "del", "priority", str(prio)],
+                                 capture_output=True).returncode == 0:
+                pass
+    ejecutar(["ip", "rule", "add", "priority", "1000", "lookup", "main", "suppress_prefixlength", "0"], True)
+    ejecutar(["ip", "rule", "add", "priority", "1100", "from", conf["ISP1_IP"], "lookup", str(TABLA["ISP1"])], True)
+    ejecutar(["ip", "rule", "add", "priority", "1101", "from", conf["ISP2_IP"], "lookup", str(TABLA["ISP2"])], True)
+    ejecutar(["ip", "rule", "add", "priority", "1200", "fwmark", "0x1/0xff", "lookup", str(TABLA["ISP1"])], True)
+    ejecutar(["ip", "rule", "add", "priority", "1201", "fwmark", "0x2/0xff", "lookup", str(TABLA["ISP2"])], True)
+
+    for isp in ("ISP1", "ISP2"):
+        ejecutar(["ip", "route", "replace", "default", "via", conf[f"{isp}_GW"],
+                  "dev", conf[f"{isp}_IF"], "table", str(TABLA[isp])])
+        # si la interfaz cae, el trafico marcado para ese ISP (y las sondas) no debe
+        # escapar por el otro: queda esta ruta de respaldo
+        ejecutar(["ip", "route", "replace", "unreachable", "default", "metric", "9999",
+                  "table", str(TABLA[isp])], True)
+
+    # default de main: ISP activo
+    activo = "ISP1" if estado["ISP1"] == "UP" or estado["ISP2"] == "DOWN" else "ISP2"
+    if not ejecutar(["ip", "route", "replace", "default", "via", conf[f"{activo}_GW"],
+                     "dev", conf[f"{activo}_IF"]]):
+        otro = OTRO[activo]
+        ejecutar(["ip", "route", "replace", "default", "via", conf[f"{otro}_GW"], "dev", conf[f"{otro}_IF"]])
+    return activo
+
+
+def borrar_conntrack():
+    """Borra las conexiones marcadas para que se vuelvan a clasificar (paquete 'conntrack')."""
+    for marca in ("1", "2"):
+        if DRY:
+            print(f"   + conntrack -D --mark {marca}")
+            continue
+        try:
+            subprocess.run(["conntrack", "-D", "--mark", marca], capture_output=True)
+        except FileNotFoundError:
+            info("   aviso: no está instalado 'conntrack' (sudo apt install conntrack)")
+            return
+
+
+# 4. Main
+def main():
+    if os.geteuid() != 0 and not (DRY or "--check" in ARGS):
+        error("ejecutar como root (sudo)")
+    conf = leer_conf(CONF)
+    politicas = leer_politicas(conf["POLITICAS"])
+    estado = leer_estado()
+    ruleset = generar_nft(conf, politicas, estado)
+
+    if "--check" in ARGS:
+        info(f"OK: {CONF} y {conf['POLITICAS']} válidos ({len(politicas)} políticas).")
+        return
+
+    # Validar el ruleset con "nft -c" ANTES de tocar nada
+    with tempfile.NamedTemporaryFile("w", suffix=".nft", delete=False) as tmp:
+        tmp.write(ruleset)
+    try:
+        r = subprocess.run(["nft", "-c", "-f", tmp.name], capture_output=True, text=True)
+        if r.returncode != 0 and not DRY:
+            error("nftables rechazó el ruleset generado:\n" + r.stderr)
+    finally:
+        os.unlink(tmp.name)
+
+    if DRY:
+        print("== Comandos de enrutamiento:")
+    activo = configurar_ruteo(conf, estado)
+
+    if DRY:
+        print("\n== Ruleset que se cargaría:\n")
+        print(ruleset)
+        return
+
+    os.makedirs(os.path.dirname(SALIDA_NFT), exist_ok=True)
+    with open(SALIDA_NFT, "w", encoding="utf-8") as f:
+        f.write(ruleset)
+    r = subprocess.run(["nft", "-f", SALIDA_NFT], capture_output=True, text=True)
+    if r.returncode != 0:
+        error("no se pudo cargar el ruleset:\n" + r.stderr)
+    if "--flush" in ARGS:
+        borrar_conntrack()
+
+    os.makedirs(os.path.dirname(RESUMEN), exist_ok=True)
+    mapa = {isp: isp_efectivo(isp, estado) for isp in ("ISP1", "ISP2")}
+    with open(RESUMEN, "w", encoding="utf-8") as f:
+        f.write(f"FECHA={datetime.now():%Y-%m-%d %H:%M:%S}\nPOLITICAS={len(politicas)}\n"
+                f"ISP1={estado['ISP1']}\nISP2={estado['ISP2']}\nDEFAULT_MAIN={activo}\n"
+                f"REGLAS_ISP1_SALEN_POR={mapa['ISP1']}\nREGLAS_ISP2_SALEN_POR={mapa['ISP2']}\n"
+                f"BALANCEO={conf['BALANCEO_MODO']} {conf['PESO_ISP1']}/{conf['PESO_ISP2']}\n")
+    msg = (f"aplicadas {len(politicas)} políticas; ISP1={estado['ISP1']} ISP2={estado['ISP2']}; "
+           f"reglas ISP1->{mapa['ISP1']}, ISP2->{mapa['ISP2']}; balanceo {conf['BALANCEO_MODO']} "
+           f"{conf['PESO_ISP1']}/{conf['PESO_ISP2']}; default main={activo}")
+    bitacora(msg)
+    info("OK: " + msg)
+
+
+if __name__ == "__main__":
+    main()

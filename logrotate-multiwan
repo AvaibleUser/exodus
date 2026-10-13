@@ -1,0 +1,14 @@
+# /etc/logrotate.d/multiwan - MWAN01
+/var/log/multiwan/*.log {
+	daily
+	rotate 14
+	compress
+	delaycompress
+	missingok
+	notifempty
+	create 0640 root adm
+	sharedscripts
+	postrotate
+		/usr/lib/rsyslog/rsyslog-rotate
+	endscript
+}

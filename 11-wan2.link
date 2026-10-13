@@ -1,0 +1,8 @@
+# /etc/systemd/network/11-wan2.link - MWAN01
+# Se identifica por driver: el celular cambia la MAC del anclaje USB en cada conexion.
+# rndis_host (Android), cdc_ncm (Android reciente), ipheth (iPhone)
+[Match]
+Driver=rndis_host cdc_ncm ipheth
+
+[Link]
+Name=wan2

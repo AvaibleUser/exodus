@@ -1,0 +1,50 @@
+#!/bin/bash
+# mwan-status - estado del Multi-WAN: sudo mwan-status [ip]  (ip consulta la IP publica por ISP)
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# shellcheck source=/dev/null
+source /etc/multiwan/multiwan.conf
+
+titulo() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
+
+titulo "Estado de los ISP (mwan-monitor)"
+cat /run/multiwan/estado 2>/dev/null || echo "(mwan-monitor no está corriendo)"
+for isp in ISP1 ISP2; do
+    printf '%s latencia: %s ms\n' "$isp" "$(cat /run/multiwan/latencia_$isp 2>/dev/null || echo '?')"
+done
+titulo "Última aplicación de políticas (mwan-apply)"
+cat /run/multiwan/aplicado 2>/dev/null
+
+titulo "Interfaces"
+ip -br addr show dev "$ISP1_IF" 2>/dev/null || echo "$ISP1_IF: no existe"
+ip -br addr show dev "$ISP2_IF" 2>/dev/null || echo "$ISP2_IF: no existe"
+ip -br addr show dev "$LAN_IF"
+
+titulo "Reglas de política (ip rule)"
+ip rule show
+titulo "Tabla main / isp1 (100) / isp2 (200)"
+ip route show | grep default
+echo "isp1: $(ip route show table 100)"
+echo "isp2: $(ip route show table 200)"
+
+titulo "Conexiones clasificadas por cada política / balanceo (contadores nft)"
+# packets N = N conexiones con esa decision (la cadena solo ve el primer paquete)
+nft list chain inet mwan clasificar 2>/dev/null | grep 'prefix "MWAN-POL' \
+    | sed -E 's/.*counter packets ([0-9]+) .*prefix "([^"]+)".*comment "([^"]*)".*/\2-> \1 conexiones   (\3)/;
+              s/.*counter packets ([0-9]+) .*prefix "([^"]+)".*/\2-> \1 conexiones/'
+
+titulo "Conexiones activas por ISP (conntrack)"
+echo "ISP1 (mark 1): $(conntrack -L --mark 1 2>/dev/null | wc -l)"
+echo "ISP2 (mark 2): $(conntrack -L --mark 2 2>/dev/null | wc -l)"
+
+titulo "Últimas decisiones (politicas.log)"
+tail -n 8 /var/log/multiwan/politicas.log 2>/dev/null | sed -E 's/ MAC=[^ ]+//'
+titulo "Últimos eventos de failover (eventos.log)"
+tail -n 8 /var/log/multiwan/eventos.log 2>/dev/null
+
+if [ "${1:-}" = "ip" ]; then
+    titulo "IP pública vista por Internet a través de cada ISP"
+    for isp in ISP1 ISP2; do
+        v="${isp}_IP"
+        printf '%s: %s\n' "$isp" "$(curl -s -m 6 --interface "${!v}" https://api.ipify.org || echo 'sin respuesta')"
+    done
+fi

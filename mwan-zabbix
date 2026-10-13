@@ -1,0 +1,17 @@
+#!/bin/bash
+# mwan-zabbix - valores para los UserParameter del agente (solo lee /run/multiwan)
+#   estado ISPn   1 UP / 0 DOWN        latencia ISPn   ms del ultimo ping, -1 si fallo
+#   politicas     numero de politicas  activo          ISP de la ruta por defecto (1 o 2)
+case "${1:-}" in
+    estado)
+        v="$(grep "^${2:-ISP1}=" /run/multiwan/estado 2>/dev/null | cut -d= -f2)"
+        [ "$v" = "UP" ] && echo 1 || echo 0 ;;
+    latencia)
+        cat "/run/multiwan/latencia_${2:-ISP1}" 2>/dev/null || echo -1 ;;
+    politicas)
+        grep -cvE '^[[:space:]]*(#|$)' /etc/multiwan/politicas.conf 2>/dev/null || echo 0 ;;
+    activo)
+        grep -q '^DEFAULT_MAIN=ISP2' /run/multiwan/aplicado 2>/dev/null && echo 2 || echo 1 ;;
+    *)
+        echo "uso: $0 estado|latencia ISP1|ISP2  |  politicas | activo" >&2; exit 1 ;;
+esac
